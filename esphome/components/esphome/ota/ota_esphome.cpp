@@ -18,12 +18,14 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 
 namespace esphome {
 
 static const char *const TAG = "esphome.ota";
 static constexpr uint16_t OTA_BLOCK_SIZE = 8192;
-static constexpr size_t OTA_BUFFER_SIZE = 1024;                  // buffer size for OTA data transfer
+static constexpr size_t OTA_BUFFER_SIZE = 1024;                  // buffer size for socket reads
+static constexpr size_t OTA_STAGING_BUFFER_SIZE = 8192;          // staging buffer to absorb one full OTA block
 static constexpr uint32_t OTA_SOCKET_TIMEOUT_HANDSHAKE = 20000;  // milliseconds for initial handshake
 static constexpr uint32_t OTA_SOCKET_TIMEOUT_DATA = 90000;       // milliseconds for data transfer
 
@@ -249,6 +251,9 @@ void ESPHomeOTAComponent::handle_data_() {
   size_t size_acknowledged = 0;
 #endif
   uint32_t last_data_time = 0;
+  // Declared at top to avoid jumping over initializations with goto
+  std::unique_ptr<uint8_t[]> staging_buffer;
+  size_t staging_len = 0;
 
   // Acknowledge auth OK - 1 byte
   this->write_byte_(ota::OTA_RESPONSE_AUTH_OK);
@@ -293,6 +298,8 @@ void ESPHomeOTAComponent::handle_data_() {
   // Acknowledge MD5 OK - 1 byte
   this->write_byte_(ota::OTA_RESPONSE_BIN_MD5_OK);
 
+  staging_buffer = std::make_unique<uint8_t[]>(OTA_STAGING_BUFFER_SIZE);
+  staging_len = 0;
   last_data_time = millis();
 
   while (total < ota_size) {
@@ -306,6 +313,14 @@ void ESPHomeOTAComponent::handle_data_() {
     ssize_t read = this->client_->read(buf, requested);
     if (read == -1) {
       if (this->would_block_(errno)) {
+        if (staging_len > 0) {
+          error_code = this->backend_->write(staging_buffer.get(), staging_len);
+          if (error_code != ota::OTA_RESPONSE_OK) {
+            ESP_LOGW(TAG, "Flash write err %d", error_code);
+            goto error;  // NOLINT(cppcoreguidelines-avoid-goto)
+          }
+          staging_len = 0;
+        }
         this->yield_and_feed_watchdog_();
         continue;
       }
@@ -317,13 +332,19 @@ void ESPHomeOTAComponent::handle_data_() {
     }
 
     last_data_time = now;
-
-    error_code = this->backend_->write(buf, read);
-    if (error_code != ota::OTA_RESPONSE_OK) {
-      ESP_LOGW(TAG, "Flash write err %d", error_code);
-      goto error;  // NOLINT(cppcoreguidelines-avoid-goto)
-    }
     total += read;
+
+    std::memcpy(staging_buffer.get() + staging_len, buf, read);
+    staging_len += read;
+
+    if (staging_len >= OTA_STAGING_BUFFER_SIZE || total == ota_size) {
+      error_code = this->backend_->write(staging_buffer.get(), staging_len);
+      if (error_code != ota::OTA_RESPONSE_OK) {
+        ESP_LOGW(TAG, "Flash write err %d", error_code);
+        goto error;  // NOLINT(cppcoreguidelines-avoid-goto)
+      }
+      staging_len = 0;
+    }
 #if USE_OTA_VERSION == 2
     while (size_acknowledged + OTA_BLOCK_SIZE <= total || (total == ota_size && size_acknowledged < ota_size)) {
       this->write_byte_(ota::OTA_RESPONSE_CHUNK_OK);

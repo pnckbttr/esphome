@@ -248,6 +248,7 @@ void ESPHomeOTAComponent::handle_data_() {
 #if USE_OTA_VERSION == 2
   size_t size_acknowledged = 0;
 #endif
+  uint32_t last_data_time = 0;
 
   // Acknowledge auth OK - 1 byte
   this->write_byte_(ota::OTA_RESPONSE_AUTH_OK);
@@ -292,8 +293,14 @@ void ESPHomeOTAComponent::handle_data_() {
   // Acknowledge MD5 OK - 1 byte
   this->write_byte_(ota::OTA_RESPONSE_BIN_MD5_OK);
 
+  last_data_time = millis();
+
   while (total < ota_size) {
-    // TODO: timeout check
+    uint32_t now = millis();
+    if (now - last_data_time > OTA_SOCKET_TIMEOUT_DATA) {
+      ESP_LOGW(TAG, "OTA timeout: no data for %" PRIu32 "ms", now - last_data_time);
+      goto error;  // NOLINT(cppcoreguidelines-avoid-goto)
+    }
     size_t remaining = ota_size - total;
     size_t requested = remaining < OTA_BUFFER_SIZE ? remaining : OTA_BUFFER_SIZE;
     ssize_t read = this->client_->read(buf, requested);
@@ -309,6 +316,7 @@ void ESPHomeOTAComponent::handle_data_() {
       goto error;  // NOLINT(cppcoreguidelines-avoid-goto)
     }
 
+    last_data_time = now;
     error_code = this->backend_->write(buf, read);
     if (error_code != ota::OTA_RESPONSE_OK) {
       ESP_LOGW(TAG, "Flash write err %d", error_code);
@@ -322,7 +330,6 @@ void ESPHomeOTAComponent::handle_data_() {
     }
 #endif
 
-    uint32_t now = millis();
     if (now - last_progress > 1000) {
       last_progress = now;
       float percentage = (total * 100.0f) / ota_size;

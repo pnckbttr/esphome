@@ -534,7 +534,14 @@ void ESPHomeOTAComponent::cleanup_connection_() {
 
 void ESPHomeOTAComponent::yield_and_feed_watchdog_() {
   App.feed_wdt();
+#if (defined(USE_ESP8266) || defined(USE_RP2040)) && defined(USE_SOCKET_IMPL_LWIP_TCP)
+  // Use socket_delay for proper lwIP integration — it yields via esp_delay()
+  // with a wake callback so recv_fn() can break the delay immediately when
+  // data arrives, matching how Application::yield_with_select_() works.
+  socket::socket_delay(1);
+#else
   delay(1);
+#endif
 }
 
 #ifdef USE_OTA_PASSWORD
